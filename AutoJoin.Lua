@@ -69,6 +69,8 @@ local function mutate(fn)
 end
 local function serverNow() return workspace:GetServerTimeNow() end
 local function windowNow() return math.floor(serverNow() / CH_DUR) end
+
+---------------------------------------------------------------- LOGIC
 local busy = false
 local cool = {} -- cool[mode] = os.clock() hết cooldown (mode lỗi thì nhường mode khác)
 
@@ -264,13 +266,13 @@ end
 
 ---------------------------------------------------------------- WINDOW
 local Window = Fluent:CreateWindow({
-    Title = "AutoJoin", SubTitle = "", TabWidth = 160,
+    Title = "Join", SubTitle = "", TabWidth = 160,
     Size = UDim2.fromOffset(560, 420), Acrylic = false, Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl,
     DropdownsOutsideWindow = true,
 })
 local Minimizer = Fluent:CreateMinimizer({
-    Icon = "rbxassetid://116068983769705", Size = UDim2.fromOffset(60, 60),
+    Icon = "home", Size = UDim2.fromOffset(60, 60),
     Position = UDim2.new(0, 320, 0, 24), Acrylic = true, Transparency = 1,
     Corner = 999, IconCorner = 999, IconTransparency = 0,
     Draggable = true, IconDraggable = true,
@@ -310,11 +312,11 @@ local function startAndWait(pod, name, mode, key, undo)
     end)
     if Options.AutoStart.Value then
         task.wait(Options.StartDelay.Value)
-
+        print("[AutoJoin] start(name):", call("request_start_game", name))
         task.wait(2)
         local tele = pod and pod:FindFirstChild("Teleporting")
         if inLobby() and not (tele and tele.Value) then
-
+            print("[AutoJoin] start():", call("request_start_game"))
         end
     end
     local t0 = os.clock()
@@ -348,7 +350,7 @@ local function joinOnce(mode)
                 st.dtry = st.dtry or {}
                 st.dtry[u] = (st.dtry[u] or 0) + 1
             end)
-
+            print("[AutoJoin] join Daily:", call("request_join_lobby", "Daily"))
             task.wait(1)
             Fluent:Notify({ Title = "Daily", Content = u .. " | " .. tostring(info.current_challenge), Duration = 4 })
             startAndWait(nil, "Daily", "Daily", u)
@@ -359,7 +361,7 @@ local function joinOnce(mode)
             local chosen = nextPortal()
             if not chosen then return end
             local pok, pres = usePortal(chosen, Options.Portal_Friends.Value)
-
+            print("[AutoJoin] use_portal", chosen, pok, pres)
             if not pok or pres == false then portalBad[chosen] = true end
             pAt = -1e9
             task.wait(1)
@@ -377,7 +379,7 @@ local function joinOnce(mode)
                 hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0)
                 task.wait(0.4)
             end
-
+            print("[AutoJoin] join", name, call("request_join_lobby", name))
             task.wait(1)
             Fluent:Notify({ Title = "Challenge " .. name, Content = key, Duration = 4 })
             mutate(function(st) st.done = st.done or {} st.done[key] = serverNow() end)
@@ -404,7 +406,7 @@ local function joinOnce(mode)
         local ok2, r2 = call("request_lock_level", name, level, friends, diff)
         task.wait(0.8)
         local lv = pod:FindFirstChild("Level")
-
+        print("[AutoJoin]", mode, name, level, diff, "| join:", ok1, r1, "| lock:", ok2, r2, "| pod.Level:", lv and lv.Value)
         -- Lock không ăn (màn chưa mở khoá...) -> rời pod, nhường mode khác
         if lv and lv.Value ~= level then
             call("request_leave_lobby", name)
@@ -415,13 +417,14 @@ local function joinOnce(mode)
         Fluent:Notify({ Title = mode, Content = name .. " | " .. level .. " | " .. diff, Duration = 4 })
         startAndWait(pod, name, mode, level)
     end)
+    if not ok then warn("[AutoJoin] lỗi:", err) end
     busy = false
 end
 
 ---------------------------------------------------------------- UI: CHUNG
 Tabs.General:AddParagraph({
     Title = "Cách dùng",
-    Content = "Ưu tiên thông minh: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode bật Auto nhưng chưa join được (daily đã xong, không có pod Challenge khớp, hết portal...) sẽ tự nhường mode kế tiếp.",
+    Content = "Ưu tiên thông minh: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode bật Auto nhưng chưa join được (daily đã xong, không có pod Challenge khớp, hết portal...) sẽ tự nhường mode kế tiếp.\nDùng nút 'Kiểm tra ưu tiên' để xem mode nào đang sẵn sàng.",
 })
 Tabs.General:AddToggle("AutoStart", { Title = "Tự bấm Start", Default = true })
 Tabs.General:AddSlider("StartDelay", { Title = "Delay trước khi Start (giây)", Default = 1, Min = 0, Max = 10, Rounding = 1 })
@@ -430,6 +433,18 @@ Tabs.General:AddToggle("LeaveOnNew", {
     Title = "Tự rời trận khi có challenge mới",
     Description = "Đang farm mà Daily mới / Challenge mới xuất hiện (và đã bật Auto tương ứng) thì về lobby để join",
     Default = false,
+})
+Tabs.General:AddButton({
+    Title = "Kiểm tra ưu tiên",
+    Callback = function()
+        local lines = {}
+        for _, m in PRIORITY do
+            local o = Options[m .. "_Auto"]
+            table.insert(lines, string.format("%s: auto=%s | sẵn sàng=%s", m, tostring(o and o.Value), tostring(canJoin(m))))
+        end
+        print("[AutoJoin]\n" .. table.concat(lines, "\n"))
+        Fluent:Notify({ Title = "Ưu tiên", Content = table.concat(lines, "\n"), Duration = 8 })
+    end,
 })
 
 ---------------------------------------------------------------- UI: Story / Infinite / Legend
@@ -460,6 +475,25 @@ Tabs.Challenge:AddToggle("Challenge_SkipDone", {
     Description = "Làm lại cùng challenge trong 30 phút chỉ nhận thưởng lặp (gem 15 thay vì 100)",
     Default = true,
 })
+Tabs.Challenge:AddButton({
+    Title = "Xem các pod",
+    Callback = function()
+        local c = workspace:FindFirstChild("_CHALLENGES")
+        local root = c and c:FindFirstChild("Challenges")
+        if not root then
+            Fluent:Notify({ Title = "Challenge", Content = "Không thấy _CHALLENGES.Challenges", Duration = 4 })
+            return
+        end
+        local lines = {}
+        for _, p in sortedPods(root, "^CH%d+$") do
+            local s = string.format("%s: %s | %s | active=%s | %s", p.Name, tostring(podValue(p, "Level")),
+                tostring(podValue(p, "Challenge")), tostring(podValue(p, "Active")), podFree(p) and "trống" or "có người")
+            print("[AutoJoin]", s)
+            table.insert(lines, s)
+        end
+        Fluent:Notify({ Title = "Pod Challenge", Content = table.concat(lines, "\n"), Duration = 10 })
+    end,
+})
 Tabs.Challenge:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Challenge") end })
 Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
 
@@ -467,6 +501,20 @@ Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp
 Tabs.Daily:AddParagraph({
     Title = "Daily Challenge",
     Content = "Join bằng request_join_lobby(\"Daily\"). Tự bỏ qua nếu hôm nay đã hoàn thành (đọc last_completed_daily_challenge_uuid), tối đa 3 lần thử/ngày.",
+})
+Tabs.Daily:AddButton({
+    Title = "Xem daily hôm nay",
+    Callback = function()
+        local info = dailyInfo(true)
+        if info then
+            local s = tostring(info.current_level_id) .. " | " .. tostring(info.current_challenge)
+                .. " | uuid " .. tostring(info.current_uuid) .. " | xong=" .. tostring(dailyDone(info.current_uuid))
+            print("[AutoJoin] daily:", s)
+            Fluent:Notify({ Title = "Daily hôm nay", Content = s, Duration = 8 })
+        else
+            Fluent:Notify({ Title = "Daily", Content = "Không lấy được dữ liệu.", Duration = 4 })
+        end
+    end,
 })
 Tabs.Daily:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Daily") end })
 Tabs.Daily:AddToggle("Daily_Auto", { Title = "Auto Join Daily (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
@@ -483,6 +531,11 @@ Tabs.Webhook:AddInput("Webhook_PingId", { Title = "Discord User ID để ping", 
 Tabs.Webhook:AddToggle("Webhook_SecretPing", { Title = "Ping khi nhận Secret (unit/item)", Default = false })
 Tabs.Webhook:AddToggle("Webhook_AfterMatch", { Title = "Gửi kết quả + item mới sau mỗi ván", Default = false })
 Tabs.Webhook:AddToggle("Webhook_Mythic", { Title = "Ping  Mythical", Default = false })
+Tabs.Webhook:AddToggle("Webhook_Debug", { Title = "Debug: in payload event ra F9", Default = false })
+Tabs.Webhook:AddButton({
+    Title = "Gửi thử",
+    Callback = function() task.spawn(function() sendWebhook("Webhook test", "Webhook đã kết nối thành công.", false) end) end,
+})
 
 local httpReq = (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
 
@@ -520,12 +573,20 @@ function sendWebhook(title, desc, shouldPing)
         })
     end)
     local status = ok and result and (result.StatusCode or result.Status)
-
+    print("[Webhook]", ok, status or result)
     local good = ok and status ~= nil and status >= 200 and status < 300
     if not good then Fluent:Notify({ Title = "Webhook lỗi", Content = tostring(status or result), Duration = 6 }) end
     return good
 end
 
+local function dump(v, d)
+    d = d or 0
+    if type(v) ~= "table" then return tostring(v) end
+    if d > 2 then return "{...}" end
+    local o = {}
+    for k, x in pairs(v) do o[#o + 1] = tostring(k) .. "=" .. dump(x, d + 1) end
+    return "{" .. table.concat(o, ", ") .. "}"
+end
 
 -- Bảng Secret: quét getgc lấy mọi bảng có rarity == "Secret" và id (unit, portal, skin...)
 local SECRET, lastLoad = {}, -1e9
@@ -542,6 +603,9 @@ local function loadSecret()
             end
         end
     end)
+    local n = 0
+    for _ in pairs(SECRET) do n += 1 end
+    print("[Secret] đã nạp", n, "id Secret")
 end
 task.spawn(loadSecret)
 
@@ -569,7 +633,7 @@ end
 local lastMatchSent = 0
 local function nm(v)
     if type(v) ~= "table" then return tostring(v) end
-    return tostring(rawget(v, "item_id") or rawget(v, "unit_id") or rawget(v, "id") or rawget(v, "name"))
+    return tostring(rawget(v, "item_id") or rawget(v, "unit_id") or rawget(v, "id") or rawget(v, "name") or dump(v))
 end
 local function sendMatchResult(p)
     if type(p) ~= "table" then return end
@@ -598,7 +662,10 @@ for k in pairs(SECRET_EVT) do WATCH[k] = 1 end
 
 local function onRemoteEvent(evt, ...)
     local args = table.pack(...)
-if Options.Webhook_SecretPing.Value then
+    local dbg = Options.Webhook_Debug
+    if dbg and dbg.Value and evt ~= "show_chat_message" then print("[WH]", evt, dump(args)) end
+
+    if Options.Webhook_SecretPing.Value then
         if SECRET_EVT[evt] or evt == "game_finished" then
             if next(SECRET) == nil then loadSecret() end
             local id = findSecret(evt == "game_finished" and type(args[1]) == "table" and args[1].new_units or args)
@@ -655,6 +722,7 @@ end)
 
 ---------------------------------------------------------------- AUTO LEAVE (trong trận)
 -- Daily: so current_uuid (dữ liệu thật). Challenge thường: theo khung 30 phút (CHALLENGE_DURATION);
+-- server chưa có event báo đổi nên đây là suy luận, xem log [AutoJoin] leave để kiểm chứng.
 local function newReason()
     local st = readState()
     if not st.mode or (os.time() - (st.joinedAt or 0)) > 14400 then return nil end -- trận không do script join
@@ -680,9 +748,9 @@ local function newReason()
 end
 
 local function leaveMatch(why)
-
+    print("[AutoJoin] leave:", why)
     Fluent:Notify({ Title = "Rời trận", Content = why, Duration = 5 })
-
+    print("[AutoJoin] teleport_back_to_lobby:", call("teleport_back_to_lobby"))
     task.wait(8)
     if not inLobby() then
         local st = readState()
