@@ -1,6 +1,3 @@
--- Auto Join (Story / Infinite / Legend / Challenge / Daily / Portal) - Fluent UI
--- Chạy ở LOBBY. Bỏ vào autoexec. Ưu tiên thông minh + tự rời trận khi có challenge mới + webhook Secret.
-
 local Fluent           = loadstring(game:HttpGet("https://raw.githubusercontent.com/discoart/FluentPlus/refs/heads/main/Beta.lua"))()
 local SaveManager      = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
 local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
