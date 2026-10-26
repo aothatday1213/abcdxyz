@@ -264,7 +264,7 @@ end
 
 ---------------------------------------------------------------- WINDOW
 local Window = Fluent:CreateWindow({
-    Title = "CanHongSon", SubTitle = "", TabWidth = 160,
+    Title = "AutoJoin", SubTitle = "", TabWidth = 160,
     Size = UDim2.fromOffset(560, 420), Acrylic = false, Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl,
     DropdownsOutsideWindow = true,
