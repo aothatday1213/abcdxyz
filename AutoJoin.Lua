@@ -80,13 +80,23 @@ local function inLobby()
     return v and v.Value == true
 end
 
+-- InvokeServer có timeout: remote treo không làm đơ cả vòng auto nữa
 local rcache = {}
+local CALL_TIMEOUT = 6
 local function call(remote, ...)
     local args = table.pack(...)
     local r = rcache[remote] or ct:FindFirstChild(remote) or RS.endpoints:FindFirstChild(remote, true)
     if not r then return false, "no remote " .. remote end
     rcache[remote] = r
-    return pcall(function() return r:InvokeServer(table.unpack(args, 1, args.n)) end)
+    local done, ok, res = false, false, nil
+    task.spawn(function()
+        ok, res = pcall(function() return r:InvokeServer(table.unpack(args, 1, args.n)) end)
+        done = true
+    end)
+    local t = os.clock()
+    while not done and os.clock() - t < CALL_TIMEOUT do task.wait(0.05) end
+    if not done then return false, "timeout" end
+    return ok, res
 end
 
 local function podValue(pod, name)
@@ -104,6 +114,22 @@ local function podFree(pod)
     if tele and tele.Value == true then return false end
     if lock and lock.Value == true then return false end
     return true
+end
+
+-- Mình có đang đứng trong pod không? true / false / nil(không rõ cấu trúc)
+local function podHasMe(pod)
+    local owner = pod:FindFirstChild("Owner")
+    if owner and owner:IsA("ObjectValue") and owner.Value == lp then return true end
+    local plrs = pod:FindFirstChild("Players")
+    if not plrs then return nil end
+    local kids = plrs:GetChildren()
+    for _, c in ipairs(kids) do
+        local val = c:IsA("ValueBase") and c.Value or nil
+        if c.Name == lp.Name or c.Name == tostring(lp.UserId) or val == lp or val == lp.Name or val == lp.UserId then
+            return true
+        end
+    end
+    return #kids > 0 -- có người nhưng không nhận ra tên: coi như là mình
 end
 
 local function sortedPods(root, pattern)
@@ -138,11 +164,10 @@ local function podAnchor(pod)
     return pod:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- ---- Daily
-local dCache, dAt, gcAt = nil, -1e9, -1e9
+-- ---- Daily (fetch nền, không chặn vòng auto)
+local dCache, dAt, gcAt, dBusy = nil, -1e9, -1e9, false
 local function isD(t) return type(t) == "table" and rawget(t, "current_uuid") ~= nil end
-local function dailyInfo(force)
-    if not force and dCache and os.clock() - dAt < 15 then return dCache end
+local function fetchDaily()
     local ok, info = call("get_daily_challenge")
     local got = (ok and isD(info)) and info or nil
     if not got and getgc and os.clock() - gcAt > 20 then
@@ -154,23 +179,34 @@ local function dailyInfo(force)
         end)
     end
     if got then dCache, dAt = got, os.clock() end
+end
+local function dailyInfo(force)
+    if force or not dCache then
+        fetchDaily() -- lần đầu / ép: chờ (đã có timeout)
+    elseif os.clock() - dAt > 15 and not dBusy then
+        dBusy = true
+        task.spawn(function() pcall(fetchDaily) dBusy = false end)
+    end
     return dCache
 end
 
 -- session._stats.last_completed_daily_challenge_uuid (theo ChallengeServiceClient)
 local KEY_DONE = "last_completed_daily_challenge_uuid"
-local statsRef, scanAt = nil, -1e9
+local statsRef, scanAt, scanning = nil, -1e9, false
 local function lastDailyDone()
     if statsRef then return rawget(statsRef, KEY_DONE) end
-    if getgc and os.clock() - scanAt > 30 then
-        scanAt = os.clock()
-        pcall(function()
-            for _, t in ipairs(getgc(true)) do
-                if type(t) == "table" and rawget(t, KEY_DONE) ~= nil then statsRef = t break end
-            end
+    if getgc and not scanning and os.clock() - scanAt > 60 then
+        scanning, scanAt = true, os.clock()
+        task.spawn(function()
+            pcall(function()
+                for _, t in ipairs(getgc(true)) do
+                    if type(t) == "table" and rawget(t, KEY_DONE) ~= nil then statsRef = t break end
+                end
+            end)
+            scanning = false
         end)
-        if statsRef then return rawget(statsRef, KEY_DONE) end
     end
+    return nil
 end
 
 local function dailyDone(uuid)
@@ -209,8 +245,8 @@ local function chMatch(p)
     return true
 end
 
--- ---- Portal (uuid 15 ký tự, item_id chứa "portal")
-local portalBad = {}
+-- ---- Portal (uuid 15 ký tự, item_id chứa "portal") - quét getgc chạy nền
+local portalBad = {} -- portalBad[uuid] = os.clock() hết hạn bỏ qua
 local function isPortalItem(d)
     return type(d) == "table" and type(rawget(d, "uuid")) == "string"
         and tostring(rawget(d, "item_id")):lower():find("portal") ~= nil
@@ -238,11 +274,20 @@ local function listPortals()
     end)
     return list
 end
-local pCache, pAt = {}, -1e9
+local pCache, pAt, pScanning = {}, -1e9, false
+local function refreshPortals()
+    if pScanning then return end
+    pScanning = true
+    task.spawn(function()
+        pCache = listPortals()
+        pAt = os.clock()
+        pScanning = false
+    end)
+end
 local function nextPortal()
-    if os.clock() - pAt > 20 then pCache = listPortals() pAt = os.clock() end
+    if os.clock() - pAt > 20 then refreshPortals() end
     for _, u in ipairs(pCache) do
-        if not portalBad[u] then return u end
+        if (portalBad[u] or 0) < os.clock() then return u end
     end
 end
 local function usePortal(uuid, friends)
@@ -250,12 +295,18 @@ local function usePortal(uuid, friends)
     return call("use_portal", uuid)
 end
 
+-- Làm nóng cache ngay khi load để lần join đầu không bị chậm
+task.spawn(function() pcall(dailyInfo, true) end)
+task.spawn(lastDailyDone)
+task.spawn(refreshPortals)
+
 -- ---- Mode nào đang join được? (dùng cho ưu tiên thông minh)
 local function canJoin(mode)
     if (cool[mode] or 0) > os.clock() then return false end
     if mode == "Daily" then
         local info = dailyInfo()
-        return info ~= nil and not dailyDone(info.current_uuid)
+        if not info then cool.Daily = os.clock() + 10 return false end
+        return not dailyDone(info.current_uuid)
     elseif mode == "Challenge" then
         return findChallengePod(chMatch) ~= nil
     elseif mode == "Portal" then
@@ -266,7 +317,7 @@ end
 
 ---------------------------------------------------------------- WINDOW
 local Window = Fluent:CreateWindow({
-    Title = "Join", SubTitle = "", TabWidth = 160,
+    Title = "join", SubTitle = "", TabWidth = 160,
     Size = UDim2.fromOffset(560, 420), Acrylic = false, Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl,
     DropdownsOutsideWindow = true,
@@ -304,28 +355,42 @@ local Tabs = {
 }
 
 ---------------------------------------------------------------- JOIN
-local function startAndWait(pod, name, mode, key, undo)
+-- Giữ nguyên pod, spam Start (retry) cho tới khi teleport / vào trận.
+-- fix(tries): callback tự sửa nếu bị rớt khỏi pod hoặc mất lock màn.
+local function startAndWait(pod, name, mode, key, undo, fix)
     local st0 = dailyInfo()
     mutate(function(st)
         st.mode, st.key, st.joinedAt, st.window = mode, tostring(key), os.time(), windowNow()
         st.dailyAtJoin = st0 and tostring(st0.current_uuid) or nil
     end)
-    if Options.AutoStart.Value then
-        task.wait(Options.StartDelay.Value)
-        print("[AutoJoin] start(name):", call("request_start_game", name))
-        task.wait(2)
+
+    local deadline = os.clock() + Options.Timeout.Value
+    local nextStart = os.clock() + Options.StartDelay.Value
+    local tries = 0
+    while os.clock() < deadline and inLobby() and not Fluent.Unloaded do
         local tele = pod and pod:FindFirstChild("Teleporting")
-        if inLobby() and not (tele and tele.Value) then
-            print("[AutoJoin] start():", call("request_start_game"))
+        local teleporting = tele and tele.Value == true
+        if teleporting then
+            deadline = math.max(deadline, os.clock() + 20) -- đang teleport: đừng rời pod
+        elseif Options.AutoStart.Value and os.clock() >= nextStart then
+            tries += 1
+            if fix then pcall(fix, tries) end
+            call("request_start_game", name)
+            task.wait(0.8)
+            if inLobby() then
+                tele = pod and pod:FindFirstChild("Teleporting")
+                if not (tele and tele.Value == true) then
+                    call("request_start_game")
+                end
+            end
+            nextStart = os.clock() + (pod and 2.5 or 4)
         end
+        task.wait(0.25)
     end
-    local t0 = os.clock()
-    while os.clock() - t0 < Options.Timeout.Value and inLobby() and not Fluent.Unloaded do
-        task.wait(1)
-    end
-    if inLobby() then -- không vào được trận: rời pod, mode này nghỉ 30s để mode khác được chạy
+
+    if inLobby() and not Fluent.Unloaded then -- không vào được trận: rời pod, nghỉ ngắn để mode khác chạy
         call("request_leave_lobby", name)
-        cool[mode] = os.clock() + 30
+        cool[mode] = os.clock() + 10
         if undo then undo() end
         task.wait(1)
     end
@@ -344,14 +409,14 @@ local function joinOnce(mode)
 
         if mode == "Daily" then
             local info = dailyInfo(true)
-            if not info then cool.Daily = os.clock() + 30 return end
+            if not info then cool.Daily = os.clock() + 10 return end
             local u = tostring(info.current_uuid)
             mutate(function(st)
                 st.dtry = st.dtry or {}
                 st.dtry[u] = (st.dtry[u] or 0) + 1
             end)
-            print("[AutoJoin] join Daily:", call("request_join_lobby", "Daily"))
-            task.wait(1)
+            call("request_join_lobby", "Daily")
+            task.wait(0.5)
             Fluent:Notify({ Title = "Daily", Content = u .. " | " .. tostring(info.current_challenge), Duration = 4 })
             startAndWait(nil, "Daily", "Daily", u)
             return
@@ -361,10 +426,10 @@ local function joinOnce(mode)
             local chosen = nextPortal()
             if not chosen then return end
             local pok, pres = usePortal(chosen, Options.Portal_Friends.Value)
-            print("[AutoJoin] use_portal", chosen, pok, pres)
-            if not pok or pres == false then portalBad[chosen] = true end
+            -- portal vừa dùng thì bỏ qua 90s (đã bị tiêu); lỗi thì bỏ qua 10 phút
+            portalBad[chosen] = os.clock() + ((not pok or pres == false) and 600 or 90)
             pAt = -1e9
-            task.wait(1)
+            task.wait(0.5)
             Fluent:Notify({ Title = "Portal", Content = chosen, Duration = 4 })
             startAndWait(nil, chosen, "Portal", chosen)
             return
@@ -377,14 +442,20 @@ local function joinOnce(mode)
             local anchor = podAnchor(pod)
             if anchor then
                 hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0)
-                task.wait(0.4)
+                task.wait(0.3)
             end
-            print("[AutoJoin] join", name, call("request_join_lobby", name))
-            task.wait(1)
+            call("request_join_lobby", name)
+            task.wait(0.5)
             Fluent:Notify({ Title = "Challenge " .. name, Content = key, Duration = 4 })
             mutate(function(st) st.done = st.done or {} st.done[key] = serverNow() end)
             startAndWait(pod, name, "Challenge", key, function()
                 mutate(function(st) if st.done then st.done[key] = nil end end)
+            end, function(tries)
+                if tries >= 2 and podHasMe(pod) == false then
+                    if anchor then hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0) task.wait(0.3) end
+                    call("request_join_lobby", name)
+                    task.wait(0.5)
+                end
             end)
             return
         end
@@ -398,24 +469,38 @@ local function joinOnce(mode)
         local diff = Options[mode .. "_Diff"].Value
         local friends = Options[mode .. "_Friends"].Value
         local name = pod.Name
+        local anchor = podAnchor(pod)
 
-        hrp.CFrame = pod.Door.CFrame + Vector3.new(0, 3, 0)
-        task.wait(0.4)
-        local ok1, r1 = call("request_join_lobby", name)
-        task.wait(0.4)
-        local ok2, r2 = call("request_lock_level", name, level, friends, diff)
-        task.wait(0.8)
+        if anchor then hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0) end
+        task.wait(0.3)
+        call("request_join_lobby", name)
+        task.wait(0.3)
+        call("request_lock_level", name, level, friends, diff)
         local lv = pod:FindFirstChild("Level")
-        print("[AutoJoin]", mode, name, level, diff, "| join:", ok1, r1, "| lock:", ok2, r2, "| pod.Level:", lv and lv.Value)
+        local t1 = os.clock()
+        while lv and lv.Value ~= level and os.clock() - t1 < 2.5 do task.wait(0.1) end
         -- Lock không ăn (màn chưa mở khoá...) -> rời pod, nhường mode khác
         if lv and lv.Value ~= level then
             call("request_leave_lobby", name)
-            cool[mode] = os.clock() + 60
+            cool[mode] = os.clock() + 20
             Fluent:Notify({ Title = mode, Content = "Không chọn được " .. level .. " (chưa mở khoá?)", Duration = 5 })
             return
         end
         Fluent:Notify({ Title = mode, Content = name .. " | " .. level .. " | " .. diff, Duration = 4 })
-        startAndWait(pod, name, mode, level)
+        startAndWait(pod, name, mode, level, nil, function(tries)
+            if tries >= 2 and podHasMe(pod) == false then
+                if anchor then hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0) task.wait(0.3) end
+                call("request_join_lobby", name)
+                task.wait(0.4)
+                call("request_lock_level", name, level, friends, diff)
+                task.wait(0.5)
+            end
+            local l2 = pod:FindFirstChild("Level")
+            if l2 and l2.Value ~= level then
+                call("request_lock_level", name, level, friends, diff)
+                task.wait(0.5)
+            end
+        end)
     end)
     if not ok then warn("[AutoJoin] lỗi:", err) end
     busy = false
@@ -424,7 +509,7 @@ end
 ---------------------------------------------------------------- UI: CHUNG
 Tabs.General:AddParagraph({
     Title = "Cách dùng",
-    Content = "Ưu tiên thông minh: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode bật Auto nhưng chưa join được (daily đã xong, không có pod Challenge khớp, hết portal...) sẽ tự nhường mode kế tiếp.\nDùng nút 'Kiểm tra ưu tiên' để xem mode nào đang sẵn sàng.",
+    Content = "Ưu tiên thông minh: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode bật Auto nhưng chưa join được (daily đã xong, không có pod Challenge khớp, hết portal...) sẽ tự nhường mode kế tiếp.",
 })
 Tabs.General:AddToggle("AutoStart", { Title = "Tự bấm Start", Default = true })
 Tabs.General:AddSlider("StartDelay", { Title = "Delay trước khi Start (giây)", Default = 1, Min = 0, Max = 10, Rounding = 1 })
@@ -433,18 +518,6 @@ Tabs.General:AddToggle("LeaveOnNew", {
     Title = "Tự rời trận khi có challenge mới",
     Description = "Đang farm mà Daily mới / Challenge mới xuất hiện (và đã bật Auto tương ứng) thì về lobby để join",
     Default = false,
-})
-Tabs.General:AddButton({
-    Title = "Kiểm tra ưu tiên",
-    Callback = function()
-        local lines = {}
-        for _, m in PRIORITY do
-            local o = Options[m .. "_Auto"]
-            table.insert(lines, string.format("%s: auto=%s | sẵn sàng=%s", m, tostring(o and o.Value), tostring(canJoin(m))))
-        end
-        print("[AutoJoin]\n" .. table.concat(lines, "\n"))
-        Fluent:Notify({ Title = "Ưu tiên", Content = table.concat(lines, "\n"), Duration = 8 })
-    end,
 })
 
 ---------------------------------------------------------------- UI: Story / Infinite / Legend
@@ -475,25 +548,6 @@ Tabs.Challenge:AddToggle("Challenge_SkipDone", {
     Description = "Làm lại cùng challenge trong 30 phút chỉ nhận thưởng lặp (gem 15 thay vì 100)",
     Default = true,
 })
-Tabs.Challenge:AddButton({
-    Title = "Xem các pod",
-    Callback = function()
-        local c = workspace:FindFirstChild("_CHALLENGES")
-        local root = c and c:FindFirstChild("Challenges")
-        if not root then
-            Fluent:Notify({ Title = "Challenge", Content = "Không thấy _CHALLENGES.Challenges", Duration = 4 })
-            return
-        end
-        local lines = {}
-        for _, p in sortedPods(root, "^CH%d+$") do
-            local s = string.format("%s: %s | %s | active=%s | %s", p.Name, tostring(podValue(p, "Level")),
-                tostring(podValue(p, "Challenge")), tostring(podValue(p, "Active")), podFree(p) and "trống" or "có người")
-            print("[AutoJoin]", s)
-            table.insert(lines, s)
-        end
-        Fluent:Notify({ Title = "Pod Challenge", Content = table.concat(lines, "\n"), Duration = 10 })
-    end,
-})
 Tabs.Challenge:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Challenge") end })
 Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
 
@@ -501,20 +555,6 @@ Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp
 Tabs.Daily:AddParagraph({
     Title = "Daily Challenge",
     Content = "Join bằng request_join_lobby(\"Daily\"). Tự bỏ qua nếu hôm nay đã hoàn thành (đọc last_completed_daily_challenge_uuid), tối đa 3 lần thử/ngày.",
-})
-Tabs.Daily:AddButton({
-    Title = "Xem daily hôm nay",
-    Callback = function()
-        local info = dailyInfo(true)
-        if info then
-            local s = tostring(info.current_level_id) .. " | " .. tostring(info.current_challenge)
-                .. " | uuid " .. tostring(info.current_uuid) .. " | xong=" .. tostring(dailyDone(info.current_uuid))
-            print("[AutoJoin] daily:", s)
-            Fluent:Notify({ Title = "Daily hôm nay", Content = s, Duration = 8 })
-        else
-            Fluent:Notify({ Title = "Daily", Content = "Không lấy được dữ liệu.", Duration = 4 })
-        end
-    end,
 })
 Tabs.Daily:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Daily") end })
 Tabs.Daily:AddToggle("Daily_Auto", { Title = "Auto Join Daily (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
@@ -531,7 +571,6 @@ Tabs.Webhook:AddInput("Webhook_PingId", { Title = "Discord User ID để ping", 
 Tabs.Webhook:AddToggle("Webhook_SecretPing", { Title = "Ping khi nhận Secret (unit/item)", Default = false })
 Tabs.Webhook:AddToggle("Webhook_AfterMatch", { Title = "Gửi kết quả + item mới sau mỗi ván", Default = false })
 Tabs.Webhook:AddToggle("Webhook_Mythic", { Title = "Ping  Mythical", Default = false })
-Tabs.Webhook:AddToggle("Webhook_Debug", { Title = "Debug: in payload event ra F9", Default = false })
 Tabs.Webhook:AddButton({
     Title = "Gửi thử",
     Callback = function() task.spawn(function() sendWebhook("Webhook test", "Webhook đã kết nối thành công.", false) end) end,
@@ -553,7 +592,7 @@ function sendWebhook(title, desc, shouldPing)
     local validPing = shouldPing and pingId:match("^%d+$") ~= nil
     if #desc > 3900 then desc = desc:sub(1, 3890) .. "\n… đã rút gọn" end
     local payload = {
-        username = "CanHongSon Inventory",
+        username = "join Inventory",
         embeds = {{
             title = title, description = desc, color = 13381611,
             fields = {
@@ -573,19 +612,9 @@ function sendWebhook(title, desc, shouldPing)
         })
     end)
     local status = ok and result and (result.StatusCode or result.Status)
-    print("[Webhook]", ok, status or result)
     local good = ok and status ~= nil and status >= 200 and status < 300
     if not good then Fluent:Notify({ Title = "Webhook lỗi", Content = tostring(status or result), Duration = 6 }) end
     return good
-end
-
-local function dump(v, d)
-    d = d or 0
-    if type(v) ~= "table" then return tostring(v) end
-    if d > 2 then return "{...}" end
-    local o = {}
-    for k, x in pairs(v) do o[#o + 1] = tostring(k) .. "=" .. dump(x, d + 1) end
-    return "{" .. table.concat(o, ", ") .. "}"
 end
 
 -- Bảng Secret: quét getgc lấy mọi bảng có rarity == "Secret" và id (unit, portal, skin...)
@@ -603,9 +632,6 @@ local function loadSecret()
             end
         end
     end)
-    local n = 0
-    for _ in pairs(SECRET) do n += 1 end
-    print("[Secret] đã nạp", n, "id Secret")
 end
 task.spawn(loadSecret)
 
@@ -633,7 +659,7 @@ end
 local lastMatchSent = 0
 local function nm(v)
     if type(v) ~= "table" then return tostring(v) end
-    return tostring(rawget(v, "item_id") or rawget(v, "unit_id") or rawget(v, "id") or rawget(v, "name") or dump(v))
+    return tostring(rawget(v, "item_id") or rawget(v, "unit_id") or rawget(v, "id") or rawget(v, "name") or "?")
 end
 local function sendMatchResult(p)
     if type(p) ~= "table" then return end
@@ -662,9 +688,6 @@ for k in pairs(SECRET_EVT) do WATCH[k] = 1 end
 
 local function onRemoteEvent(evt, ...)
     local args = table.pack(...)
-    local dbg = Options.Webhook_Debug
-    if dbg and dbg.Value and evt ~= "show_chat_message" then print("[WH]", evt, dump(args)) end
-
     if Options.Webhook_SecretPing.Value then
         if SECRET_EVT[evt] or evt == "game_finished" then
             if next(SECRET) == nil then loadSecret() end
@@ -695,34 +718,56 @@ if eps then
 end
 
 ---------------------------------------------------------------- AUTO LOOP (lobby)
+-- autoTick chạy mỗi 0.5s VÀ chạy ngay lập tức khi bật toggle Auto / khi load config
 local lastHandled
+local ticking = false
+local function autoTick()
+    if ticking or busy or Fluent.Unloaded or not inLobby() then return end
+    ticking = true
+    local ok, err = pcall(function()
+        -- chọn mode đầu tiên theo ưu tiên mà đã bật Auto VÀ đang join được
+        for _, mode in PRIORITY do
+            local o = Options[mode .. "_Auto"]
+            if o and o.Value and canJoin(mode) then
+                joinOnce(mode)
+                break
+            end
+        end
+        -- đã kiểm tra challenge của khung 30 phút này (tránh rời trận lặp)
+        local w = windowNow()
+        if w ~= lastHandled then
+            lastHandled = w
+            mutate(function(st) st.chHandled = w end)
+        end
+    end)
+    ticking = false
+    if not ok then warn("[AutoJoin] tick lỗi:", err) end
+end
+
+for _, m in PRIORITY do
+    local o = Options[m .. "_Auto"]
+    if o then
+        o:OnChanged(function()
+            cool[m] = nil -- bật lại là thử ngay, bỏ cooldown cũ
+            if o.Value then task.spawn(autoTick) end
+        end)
+    end
+end
+
 task.spawn(function()
     pcall(function() workspace:WaitForChild("_MAP_CONFIG", 15) end)
     if inLobby() then mutate(function(st) st.lobbyPlace = game.PlaceId end) end
+end)
+task.spawn(function()
     while not Fluent.Unloaded do
-        if inLobby() and not busy then
-            -- chọn mode đầu tiên theo ưu tiên mà đã bật Auto VÀ đang join được
-            for _, mode in PRIORITY do
-                local o = Options[mode .. "_Auto"]
-                if o and o.Value and canJoin(mode) then
-                    joinOnce(mode)
-                    break
-                end
-            end
-            -- đã kiểm tra challenge của khung 30 phút này (tránh rời trận lặp)
-            local w = windowNow()
-            if w ~= lastHandled then
-                lastHandled = w
-                mutate(function(st) st.chHandled = w end)
-            end
-        end
-        task.wait(2)
+        autoTick()
+        task.wait(0.5)
     end
 end)
 
 ---------------------------------------------------------------- AUTO LEAVE (trong trận)
 -- Daily: so current_uuid (dữ liệu thật). Challenge thường: theo khung 30 phút (CHALLENGE_DURATION);
--- server chưa có event báo đổi nên đây là suy luận, xem log [AutoJoin] leave để kiểm chứng.
+-- server chưa có event báo đổi nên đây là suy luận.
 local function newReason()
     local st = readState()
     if not st.mode or (os.time() - (st.joinedAt or 0)) > 14400 then return nil end -- trận không do script join
@@ -748,9 +793,8 @@ local function newReason()
 end
 
 local function leaveMatch(why)
-    print("[AutoJoin] leave:", why)
     Fluent:Notify({ Title = "Rời trận", Content = why, Duration = 5 })
-    print("[AutoJoin] teleport_back_to_lobby:", call("teleport_back_to_lobby"))
+    call("teleport_back_to_lobby")
     task.wait(8)
     if not inLobby() then
         local st = readState()
@@ -783,5 +827,6 @@ InterfaceManager:BuildInterfaceSection(Tabs.Settings)
 SaveManager:BuildConfigSection(Tabs.Settings)
 
 Window:SelectTab(2)
-Fluent:Notify({ Title = "Auto Join", Content = "Đã tải script.", Duration = 5 })
+Fluent:Notify({ Title = "join", Content = "Đã tải script.", Duration = 5 })
 SaveManager:LoadAutoloadConfig()
+task.defer(autoTick) -- config xong là join luôn, không chờ vòng lặp
