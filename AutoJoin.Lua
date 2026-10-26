@@ -318,7 +318,7 @@ end
 ---------------------------------------------------------------- WINDOW
 local Window = Fluent:CreateWindow({
     Title = "join", SubTitle = "", TabWidth = 160,
-    Size = UDim2.fromOffset(560, 420), Acrylic = false, Theme = "Dark",
+    Size = UDim2.fromOffset(500, 360), Acrylic = false, Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl,
     DropdownsOutsideWindow = true,
 })
