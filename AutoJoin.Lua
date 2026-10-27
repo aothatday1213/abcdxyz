@@ -251,44 +251,36 @@ local function isPortalItem(d)
     return type(d) == "table" and type(rawget(d, "uuid")) == "string"
         and tostring(rawget(d, "item_id")):lower():find("portal") ~= nil
 end
-local function listPortals()
-    local list, seen = {}, {}
-    if not getgc then return list end
+-- Quét getgc đồng bộ, dừng ngay khi gặp portal dùng được (giống đoạn dò, nên ra portal liền)
+local function findPortal()
+    if not getgc then return nil end
+    local found
     pcall(function()
         for _, t in getgc(true) do
             if type(t) == "table" then
-                local cands = {}
-                if isPortalItem(t) then cands[1] = t
+                if isPortalItem(t) then
+                    if (portalBad[t.uuid] or 0) < os.clock() then found = t.uuid return end
                 else
                     local ui = rawget(t, "unique_items")
-                    if type(ui) == "table" then cands = ui end
-                end
-                for _, d in pairs(cands) do
-                    if isPortalItem(d) and not seen[d.uuid] then
-                        seen[d.uuid] = true
-                        table.insert(list, d.uuid)
+                    if type(ui) == "table" then
+                        for _, d in pairs(ui) do
+                            if isPortalItem(d) and (portalBad[d.uuid] or 0) < os.clock() then found = d.uuid return end
+                        end
                     end
                 end
             end
         end
     end)
-    return list
+    return found
 end
-local pCache, pAt, pScanning = {}, -1e9, false
-local function refreshPortals()
-    if pScanning then return end
-    pScanning = true
-    task.spawn(function()
-        pCache = listPortals()
-        pAt = os.clock()
-        pScanning = false
-    end)
-end
+local pLast, pAt, pTry = nil, -1e9, -1e9
 local function nextPortal()
-    if os.clock() - pAt > 20 then refreshPortals() end
-    for _, u in ipairs(pCache) do
-        if (portalBad[u] or 0) < os.clock() then return u end
-    end
+    if pLast and (portalBad[pLast] or 0) < os.clock() and os.clock() - pAt < 20 then return pLast end
+    if os.clock() - pTry < 3 then return nil end -- không quét lại liên tục khi hết portal
+    pTry = os.clock()
+    pLast = findPortal()
+    pAt = os.clock()
+    return pLast
 end
 local function usePortal(uuid, friends)
     if friends then return call("use_portal", uuid, { friends_only = true }) end
@@ -298,7 +290,7 @@ end
 -- Làm nóng cache ngay khi load để lần join đầu không bị chậm
 task.spawn(function() pcall(dailyInfo, true) end)
 task.spawn(lastDailyDone)
-task.spawn(refreshPortals)
+task.spawn(nextPortal)
 
 -- ---- Mode nào đang join được? (dùng cho ưu tiên thông minh)
 local function canJoin(mode)
@@ -318,7 +310,7 @@ end
 ---------------------------------------------------------------- WINDOW
 local Window = Fluent:CreateWindow({
     Title = "join", SubTitle = "", TabWidth = 160,
-    Size = UDim2.fromOffset(500, 360), Acrylic = false, Theme = "Dark",
+    Size = UDim2.fromOffset(560, 420), Acrylic = false, Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl,
     DropdownsOutsideWindow = true,
 })
@@ -365,7 +357,7 @@ local function startAndWait(pod, name, mode, key, undo, fix)
     end)
 
     local deadline = os.clock() + Options.Timeout.Value
-    local nextStart = os.clock() + Options.StartDelay.Value
+    local nextStart = os.clock() + ((mode == "Portal") and 0 or Options.StartDelay.Value)
     local tries = 0
     while os.clock() < deadline and inLobby() and not Fluent.Unloaded do
         local tele = pod and pod:FindFirstChild("Teleporting")
@@ -383,7 +375,7 @@ local function startAndWait(pod, name, mode, key, undo, fix)
                     call("request_start_game")
                 end
             end
-            nextStart = os.clock() + (pod and 2.5 or 4)
+            nextStart = os.clock() + ((pod or mode == "Portal") and 2.5 or 4)
         end
         task.wait(0.25)
     end
@@ -426,6 +418,14 @@ local function joinOnce(mode)
             local chosen = nextPortal()
             if not chosen then return end
             local pok, pres = usePortal(chosen, Options.Portal_Friends.Value)
+            -- thành công: server trả về bảng lobby (có LevelData). Khác thế (bận/lỗi): bỏ portal này 12 phút
+            if not (pok and type(pres) == "table" and pres.LevelData ~= nil) then
+                portalBad[chosen] = os.clock() + 720
+                cool.Portal = os.clock() + 15
+                pAt = -1e9
+                Fluent:Notify({ Title = "Portal", Content = "Portal không dùng được (đang bận?), thử portal khác sau.", Duration = 4 })
+                return
+            end
             -- portal vừa dùng thì bỏ qua 90s (đã bị tiêu); lỗi thì bỏ qua 10 phút
             portalBad[chosen] = os.clock() + ((not pok or pres == false) and 600 or 90)
             pAt = -1e9
@@ -516,7 +516,7 @@ Tabs.General:AddSlider("StartDelay", { Title = "Delay trước khi Start (giây)
 Tabs.General:AddSlider("Timeout", { Title = "Rời pod nếu chưa vào trận sau (giây)", Default = 25, Min = 10, Max = 90, Rounding = 0 })
 Tabs.General:AddToggle("LeaveOnNew", {
     Title = "Tự rời trận khi có challenge mới",
-    Description = "Đang farm mà Daily mới / Challenge mới xuất hiện (và đã bật Auto tương ứng) thì về lobby để join",
+    Description = "Đang farm mà sang khung 30 phút mới (hoặc Daily mới) và đã bật Auto tương ứng thì về lobby để join. Trận Story/Infinite đang chơi sẽ bị bỏ ở mỗi mốc :00 / :30.",
     Default = false,
 })
 
@@ -719,7 +719,6 @@ end
 
 ---------------------------------------------------------------- AUTO LOOP (lobby)
 -- autoTick chạy mỗi 0.5s VÀ chạy ngay lập tức khi bật toggle Auto / khi load config
-local lastHandled
 local ticking = false
 local function autoTick()
     if ticking or busy or Fluent.Unloaded or not inLobby() then return end
@@ -732,12 +731,6 @@ local function autoTick()
                 joinOnce(mode)
                 break
             end
-        end
-        -- đã kiểm tra challenge của khung 30 phút này (tránh rời trận lặp)
-        local w = windowNow()
-        if w ~= lastHandled then
-            lastHandled = w
-            mutate(function(st) st.chHandled = w end)
         end
     end)
     ticking = false
@@ -766,15 +759,16 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- AUTO LEAVE (trong trận)
--- Daily: so current_uuid (dữ liệu thật). Challenge thường: theo khung 30 phút (CHALLENGE_DURATION);
--- server chưa có event báo đổi nên đây là suy luận.
+-- Trong trận không có dữ liệu challenge (không có _CHALLENGES, server không bắn event),
+-- nên chỉ dựa vào mốc khung 30 phút (CHALLENGE_DURATION); về lobby mới đọc pod để lọc.
+-- Daily: so current_uuid (dữ liệu thật).
 local function newReason()
     local st = readState()
     if not st.mode or (os.time() - (st.joinedAt or 0)) > 14400 then return nil end -- trận không do script join
-    local info = dailyInfo()
     local w = windowNow()
 
     if st.mode == "Daily" then
+        local info = dailyInfo()
         if info and tostring(info.current_uuid) ~= tostring(st.key) then return "Daily đã đổi" end
         return nil
     end
@@ -782,11 +776,12 @@ local function newReason()
         if w ~= st.window then return "Challenge đã đổi" end
         return nil
     end
+    local info = dailyInfo()
     if Options.Daily_Auto.Value and info and tostring(info.current_uuid) ~= tostring(st.dailyAtJoin)
         and not dailyDone(info.current_uuid) then
         return "Daily mới"
     end
-    if Options.Challenge_Auto.Value and w ~= st.window and w ~= st.chHandled then
+    if Options.Challenge_Auto.Value and w ~= st.window then
         return "Challenge mới"
     end
     return nil
@@ -794,6 +789,8 @@ end
 
 local function leaveMatch(why)
     Fluent:Notify({ Title = "Rời trận", Content = why, Duration = 5 })
+    -- đánh dấu khung hiện tại đã xử lý để không rời lặp nếu teleport chậm
+    mutate(function(st) st.window = windowNow() end)
     call("teleport_back_to_lobby")
     task.wait(8)
     if not inLobby() then
