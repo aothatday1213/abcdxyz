@@ -72,6 +72,7 @@ local function windowNow() return math.floor(serverNow() / CH_DUR) end
 
 ---------------------------------------------------------------- LOGIC
 local busy = false
+local StatP
 local cool = {} -- cool[mode] = os.clock() hết cooldown (mode lỗi thì nhường mode khác)
 
 local function inLobby()
@@ -192,15 +193,16 @@ end
 
 -- session._stats.last_completed_daily_challenge_uuid (theo ChallengeServiceClient)
 local KEY_DONE = "last_completed_daily_challenge_uuid"
+local scanT0 = os.clock()
 local statsRef, scanAt, scanning = nil, -1e9, false
 local function lastDailyDone()
     if statsRef then return rawget(statsRef, KEY_DONE) end
-    if getgc and not scanning and os.clock() - scanAt > 60 then
+    if getgc and not scanning and os.clock() - scanAt > ((os.clock() - scanT0 < 40) and 3 or 30) then
         scanning, scanAt = true, os.clock()
         task.spawn(function()
             pcall(function()
                 for _, t in ipairs(getgc(true)) do
-                    if type(t) == "table" and rawget(t, KEY_DONE) ~= nil then statsRef = t break end
+                    if type(t) == "table" and (rawget(t, KEY_DONE) ~= nil or (rawget(t, "tracked_stats") ~= nil and rawget(t, "raid_tries") ~= nil)) then statsRef = t break end
                 end
             end)
             scanning = false
@@ -214,42 +216,71 @@ local function dailyDone(uuid)
     local d = lastDailyDone()
     if d ~= nil and tostring(d) == uuid then return true end
     local st = readState()
+    if st.ddone and st.ddone[uuid] then return true end
     local n = (st.dtry and st.dtry[uuid]) or 0
     -- đọc được stats: cho thử tối đa 3 lần; không đọc được: thử 1 lần/ngày
-    return n >= ((d ~= nil) and 3 or 1)
+    return n >= ((statsRef ~= nil) and 3 or 1)
 end
 
 -- ---- Challenge
 local function chKey(p) return tostring(podValue(p, "Level")) .. "|" .. tostring(podValue(p, "Challenge")) end
+-- done[key] = số khung 30p đã hoàn thành (ghi khi THẮNG / thua 2 lần, không ghi lúc join)
+-- last_completed_challenge_uuid = floor(giờ server / 1800) = windowNow() khi đã xong challenge trong khung này
+local function chStat()
+    lastDailyDone() -- đảm bảo đã quét statsRef
+    return statsRef and rawget(statsRef, "last_completed_challenge_uuid") or nil
+end
 local function chDone(key)
     local st = readState()
-    local t = st.done and st.done[key]
-    return t ~= nil and (serverNow() - t) < CH_DUR
+    local w = windowNow()
+    if st.done ~= nil and st.done[key] == w then return true end
+    if chStat() == w then return true end -- stats báo đã xong challenge khung này
+    return false
 end
-
-local function chMatch(p)
-    local act = p:FindFirstChild("Active")
-    if act and act.Value == false then return false end
-    if Options.Challenge_Pods.Value[p.Name] ~= true then return false end
+local function allSel(set, n) -- chọn hết = coi như không lọc
+    local c = 0
+    for _, v in pairs(set or {}) do if v == true then c += 1 end end
+    return c >= n
+end
+local function chWhy(p) -- nil = join được, ngược lại trả lý do
+    local lv = podValue(p, "Level")
+    if lv == nil or lv == "" then return "chưa nạp" end -- server chưa gán challenge cho pod
     local mods = Options.Challenge_Mods.Value
-    if hasAny(mods) and mods[podValue(p, "Challenge")] ~= true then return false end
+    if hasAny(mods) and not allSel(mods, #CH_MODS) and mods[podValue(p, "Challenge")] ~= true then
+        return "sai modifier(" .. tostring(podValue(p, "Challenge")) .. ")"
+    end
     local ws = Options.Challenge_Worlds.Value
-    if hasAny(ws) then
+    if hasAny(ws) and not allSel(ws, #WORLD_NAMES) then
         local w, ok = tostring(podValue(p, "World")), false
         for n, v in pairs(ws) do
             if v == true and WORLDS[n] == w then ok = true end
         end
-        if not ok then return false end
+        if not ok then return "sai map(" .. w .. ")" end
     end
-    if Options.Challenge_SkipDone.Value and chDone(chKey(p)) then return false end
-    return true
+    local key = chKey(p)
+    if Options.Challenge_SkipDone.Value and chDone(key) then return "đã làm" end
+    local act = p:FindFirstChild("Active")
+    if act and act.Value == false and not Options.Challenge_IgnoreActive.Value then return "inactive" end
+    return nil
 end
+local function chMatch(p) return chWhy(p) == nil end
 
 -- ---- Portal (uuid 15 ký tự, item_id chứa "portal") - quét getgc chạy nền
 local portalBad = {} -- portalBad[uuid] = os.clock() hết hạn bỏ qua
 local function isPortalItem(d)
     return type(d) == "table" and type(rawget(d, "uuid")) == "string"
         and tostring(rawget(d, "item_id")):lower():find("portal") ~= nil
+end
+-- Portal đang CD: _arx_in_match_until còn ở tương lai (đang trong trận/chờ), hoặc đã hết lượt (_portal_tries >= _portal_max_tries)
+local function portalCD(d)
+    local untilT = rawget(d, "_arx_in_match_until")
+    if type(untilT) == "number" and untilT > serverNow() then return true end
+    local ud = rawget(d, "_unique_item_data")
+    if type(ud) == "table" then
+        local tr, mx = rawget(ud, "_portal_tries"), rawget(ud, "_portal_max_tries")
+        if type(tr) == "number" and type(mx) == "number" and tr >= mx then return true end
+    end
+    return false
 end
 -- Quét getgc đồng bộ, dừng ngay khi gặp portal dùng được (giống đoạn dò, nên ra portal liền)
 local function findPortal()
@@ -259,12 +290,12 @@ local function findPortal()
         for _, t in getgc(true) do
             if type(t) == "table" then
                 if isPortalItem(t) then
-                    if (portalBad[t.uuid] or 0) < os.clock() then found = t.uuid return end
+                    if (portalBad[t.uuid] or 0) < os.clock() and not portalCD(t) then found = t.uuid return end
                 else
                     local ui = rawget(t, "unique_items")
                     if type(ui) == "table" then
                         for _, d in pairs(ui) do
-                            if isPortalItem(d) and (portalBad[d.uuid] or 0) < os.clock() then found = d.uuid return end
+                            if isPortalItem(d) and (portalBad[d.uuid] or 0) < os.clock() and not portalCD(d) then found = d.uuid return end
                         end
                     end
                 end
@@ -292,19 +323,74 @@ task.spawn(function() pcall(dailyInfo, true) end)
 task.spawn(lastDailyDone)
 task.spawn(nextPortal)
 
--- ---- Mode nào đang join được? (dùng cho ưu tiên thông minh)
-local function canJoin(mode)
-    if (cool[mode] or 0) > os.clock() then return false end
+-- ---- Trạng thái mode: "ready" = join; "wait" = giữ chỗ (KHÔNG nhường mode thấp hơn); "skip" = nhường mode kế
+local STAT, pendSince, lastSkip = {}, nil, nil
+local bootAt = os.clock() -- chờ dữ liệu tải xong
+local function booting() return os.clock() - bootAt < 25 end
+local function setS(mode, s, why) STAT[mode] = s .. (why and (" | " .. why) or "") return s end
+local function modeStatus(mode)
+    local hold = (mode == "Daily" or mode == "Challenge")
+    if (cool[mode] or 0) > os.clock() then return setS(mode, hold and "wait" or "skip", "cooldown") end
     if mode == "Daily" then
         local info = dailyInfo()
-        if not info then cool.Daily = os.clock() + 10 return false end
-        return not dailyDone(info.current_uuid)
+        if not info then
+            if booting() then return setS(mode, "wait", "đang tải daily") end
+            cool.Daily = os.clock() + 10 return setS(mode, "skip", "chưa đọc được daily")
+        end
+        if dailyDone(info.current_uuid) then return setS(mode, "skip", "đã xong") end
+        return setS(mode, "ready", tostring(info.current_challenge))
     elseif mode == "Challenge" then
-        return findChallengePod(chMatch) ~= nil
+        local c = workspace:FindFirstChild("_CHALLENGES")
+        local pods = sortedPods(c and c:FindFirstChild("Challenges"), "^CH%d+$")
+        -- Chưa đủ dữ liệu (pod chưa nạp, chưa đọc được stats) thì CHƯA được kết luận => giữ chỗ, không nhường Portal
+        local loaded = false
+        for _, p in ipairs(pods) do local lv = podValue(p, "Level") if lv ~= nil and lv ~= "" then loaded = true end end
+        lastDailyDone() -- kích hoạt quét stats
+        local statsOK = statsRef ~= nil or not getgc or os.clock() - bootAt > 60
+        if not loaded or not statsOK then return setS(mode, "wait", "đang tải dữ liệu challenge/stats") end
+        local free, pend, lines, transient = nil, false, {}, false
+        for _, p in ipairs(pods) do
+            local why = chWhy(p)
+            if why == nil or why == "chưa nạp" or (why == "inactive" and (booting() or workspace:GetServerTimeNow() % CH_DUR < 20)) then transient = true end
+            if not why then
+                if podFree(p) then free = free or p why = "OK" else pend = true why = "pod bận" end
+            end
+            table.insert(lines, p.Name .. ":" .. why)
+        end
+        local d = (#pods == 0) and "chưa thấy pod CH" or table.concat(lines, " ")
+        if free then pendSince = nil return setS(mode, "ready", d) end
+        if pend then
+            pendSince = pendSince or os.clock()
+            if os.clock() - pendSince < 20 then return setS(mode, "wait", d) end
+        else
+            pendSince = nil
+        end
+        -- chưa làm (còn pod chưa xong / inactive tạm thời / chưa thấy pod): GIỮ CHỖ, chặn Portal
+        if transient or #pods == 0 then return setS(mode, "wait", d) end
+        if lastSkip ~= d then
+            lastSkip = d
+            print("[AutoJoin] Challenge SKIP -> nhường mode sau | " .. d .. " | stat=" .. tostring(chStat()) .. " window=" .. tostring(windowNow()))
+        end
+        return setS(mode, "skip", d) -- tất cả pod: đã làm / sai lọc / lỗi 3 lần -> nhường Portal
     elseif mode == "Portal" then
-        return nextPortal() ~= nil
+        if nextPortal() then return setS(mode, "ready", "có portal") end
+        return setS(mode, "skip", "hết portal / đang CD")
     end
-    return findStoryPod(Options[mode .. "_Pod"].Value) ~= nil
+    local pod = findStoryPod(Options[mode .. "_Pod"].Value)
+    if pod then return setS(mode, "ready", pod.Name) end
+    return setS(mode, "skip", "không có pod trống")
+end
+
+-- Mode ưu tiên CAO HƠN mình (đang bật Auto) đang "ready"/"wait" thì trả về trạng thái đó
+local function higherState(mode)
+    for _, m in PRIORITY do
+        if m == mode then return nil end
+        local o = Options[m .. "_Auto"]
+        if o and o.Value then
+            local st = modeStatus(m)
+            if st ~= "skip" then return st, m end
+        end
+    end
 end
 
 ---------------------------------------------------------------- WINDOW
@@ -356,15 +442,17 @@ local function startAndWait(pod, name, mode, key, undo, fix)
         st.dailyAtJoin = st0 and tostring(st0.current_uuid) or nil
     end)
 
-    local deadline = os.clock() + Options.Timeout.Value
     local nextStart = os.clock() + ((mode == "Portal") and 0 or Options.StartDelay.Value)
-    local tries = 0
-    while os.clock() < deadline and inLobby() and not Fluent.Unloaded do
+    local tries, nextCheck, preempted = 0, 0, false
+    while inLobby() and not Fluent.Unloaded do
         local tele = pod and pod:FindFirstChild("Teleporting")
         local teleporting = tele and tele.Value == true
-        if teleporting then
-            deadline = math.max(deadline, os.clock() + 20) -- đang teleport: đừng rời pod
-        elseif Options.AutoStart.Value and os.clock() >= nextStart then
+        -- đang chờ ở pod mà mode ưu tiên cao hơn đã sẵn sàng => nhường ngay (chỉ pod; portal/daily teleport nhanh, không rời được)
+        if pod and not teleporting and os.clock() >= nextCheck then
+            nextCheck = os.clock() + 1
+            if (higherState(mode)) == "ready" then preempted = true break end
+        end
+        if not teleporting and Options.AutoStart.Value and os.clock() >= nextStart then
             tries += 1
             if fix then pcall(fix, tries) end
             call("request_start_game", name)
@@ -380,15 +468,14 @@ local function startAndWait(pod, name, mode, key, undo, fix)
         task.wait(0.25)
     end
 
-    if inLobby() and not Fluent.Unloaded then -- không vào được trận: rời pod, nghỉ ngắn để mode khác chạy
+    if preempted and inLobby() and not Fluent.Unloaded then -- nhường mode ưu tiên cao hơn
         call("request_leave_lobby", name)
-        cool[mode] = os.clock() + 10
-        if undo then undo() end
+        cool[mode] = os.clock() + 2
         task.wait(1)
     end
 end
 
-local function joinOnce(mode)
+local function joinOnce(mode, auto)
     if busy then return end
     busy = true
     local ok, err = pcall(function()
@@ -415,8 +502,15 @@ local function joinOnce(mode)
         end
 
         if mode == "Portal" then
+            if auto then -- chốt chặn cuối: mode cao hơn đang ready/wait thì không dùng portal
+                local hs, hm = higherState("Portal")
+                if hs then print("[AutoJoin] Portal bị chặn bởi " .. tostring(hm) .. " (" .. hs .. ")") return end
+            end
             local chosen = nextPortal()
             if not chosen then return end
+            local snap = {}
+            for _, m in PRIORITY do if STAT[m] then table.insert(snap, m .. "=" .. STAT[m]) end end
+            print("[AutoJoin] DÙNG PORTAL " .. (auto and "(auto)" or "(tay)") .. " | " .. table.concat(snap, " ; "))
             local pok, pres = usePortal(chosen, Options.Portal_Friends.Value)
             -- thành công: server trả về bảng lobby (có LevelData). Khác thế (bận/lỗi): bỏ portal này 12 phút
             if not (pok and type(pres) == "table" and pres.LevelData ~= nil) then
@@ -447,10 +541,7 @@ local function joinOnce(mode)
             call("request_join_lobby", name)
             task.wait(0.5)
             Fluent:Notify({ Title = "Challenge " .. name, Content = key, Duration = 4 })
-            mutate(function(st) st.done = st.done or {} st.done[key] = serverNow() end)
-            startAndWait(pod, name, "Challenge", key, function()
-                mutate(function(st) if st.done then st.done[key] = nil end end)
-            end, function(tries)
+            startAndWait(pod, name, "Challenge", key, nil, function(tries)
                 if tries >= 2 and podHasMe(pod) == false then
                     if anchor then hrp.CFrame = anchor.CFrame + Vector3.new(0, 3, 0) task.wait(0.3) end
                     call("request_join_lobby", name)
@@ -509,11 +600,13 @@ end
 ---------------------------------------------------------------- UI: CHUNG
 Tabs.General:AddParagraph({
     Title = "Cách dùng",
-    Content = "Ưu tiên thông minh: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode bật Auto nhưng chưa join được (daily đã xong, không có pod Challenge khớp, hết portal...) sẽ tự nhường mode kế tiếp.",
+    Content = "Ưu tiên: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode đã xong/không có thì nhường mode kế; mode đang chờ (cooldown, pod bận, đợi challenge mới) thì GIỮ chỗ, không nhảy sang Portal.",
 })
+StatP = Tabs.General:AddParagraph({ Title = "Đang làm / cần làm", Content = "..." })
 Tabs.General:AddToggle("AutoStart", { Title = "Tự bấm Start", Default = true })
 Tabs.General:AddSlider("StartDelay", { Title = "Delay trước khi Start (giây)", Default = 1, Min = 0, Max = 10, Rounding = 1 })
-Tabs.General:AddSlider("Timeout", { Title = "Rời pod nếu chưa vào trận sau (giây)", Default = 25, Min = 10, Max = 90, Rounding = 0 })
+Tabs.General:AddToggle("AutoLeaveFinish", { Title = "Tự về lobby khi kết thúc ván", Description = "Hết trận (thắng/thua) là teleport về lobby, không chờ màn kết quả", Default = true })
+Tabs.General:AddDropdown("LeaveModes", { Title = "Chỉ về lobby khi ván thuộc mode", Description = "Mode không chọn thì ở lại trận. 'Khác' = trận không do script join", Values = { "Story", "Infinite", "Legend", "Challenge", "Daily", "Portal", "Khác" }, Multi = true, Default = { "Challenge", "Daily" } })
 Tabs.General:AddToggle("LeaveOnNew", {
     Title = "Tự rời trận khi có challenge mới",
     Description = "Đang farm mà sang khung 30 phút mới (hoặc Daily mới) và đã bật Auto tương ứng thì về lobby để join. Trận Story/Infinite đang chơi sẽ bị bỏ ở mỗi mốc :00 / :30.",
@@ -538,9 +631,8 @@ buildStoryLike("Legend", Tabs.Legend, false, LEGEND_ACTS, "Shibuya Legend 1-3")
 ---------------------------------------------------------------- UI: Challenge
 Tabs.Challenge:AddParagraph({
     Title = "Challenge",
-    Content = "Pod CH có màn + modifier do server gán, đổi mỗi 30 phút. Script chỉ join pod Active, trống và khớp lọc.\nKhông chọn Modifier/Map = join bất kỳ.",
+    Content = "Pod CH có màn + modifier do server gán, đổi mỗi 30 phút. Script tự quét cả 4 pod CH, pod nào Active + trống + khớp lọc + chưa làm thì join.\nKhông chọn Modifier/Map = join bất kỳ.",
 })
-Tabs.Challenge:AddDropdown("Challenge_Pods", { Title = "Pod được phép join (chọn nhiều)", Values = CH_PODS, Multi = true, Default = { "CH1", "CH2", "CH3", "CH4" } })
 Tabs.Challenge:AddDropdown("Challenge_Mods", { Title = "Chỉ join modifier (chọn nhiều)", Values = CH_MODS, Multi = true, Default = {} })
 Tabs.Challenge:AddDropdown("Challenge_Worlds", { Title = "Chỉ join map (chọn nhiều)", Values = WORLD_NAMES, Multi = true, Default = {} })
 Tabs.Challenge:AddToggle("Challenge_SkipDone", {
@@ -548,6 +640,7 @@ Tabs.Challenge:AddToggle("Challenge_SkipDone", {
     Description = "Làm lại cùng challenge trong 30 phút chỉ nhận thưởng lặp (gem 15 thay vì 100)",
     Default = true,
 })
+Tabs.Challenge:AddToggle("Challenge_IgnoreActive", { Title = "Bỏ qua cờ Active (thử)", Description = "Bật nếu pod báo inactive nhưng bạn vẫn vào được", Default = false })
 Tabs.Challenge:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Challenge") end })
 Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
 
@@ -686,8 +779,36 @@ local SECRET_EVT = { unit_added = 1, normal_item_added = 1, unique_item_added = 
 local WATCH = { game_finished = 1, show_chat_message = 1 }
 for k in pairs(SECRET_EVT) do WATCH[k] = 1 end
 
+local function onFinish(p)
+    local st = readState()
+    if not st.mode or os.time() - (st.joinedAt or 0) > 14400 then return end
+    local win = (type(p) == "table" and p.victory == true)
+    mutate(function(s)
+        if s.mode == "Challenge" and s.key then
+            s.done, s.lose = s.done or {}, s.lose or {}
+            local lk = s.key .. "@" .. tostring(s.window)
+            if win then s.done[s.key] = s.window
+            else
+                s.lose[lk] = (s.lose[lk] or 0) + 1
+                if s.lose[lk] >= 2 then s.done[s.key] = s.window end -- thua 2 lần: bỏ khung này
+            end
+        elseif s.mode == "Daily" and win and s.key then
+            s.ddone = s.ddone or {}
+            s.ddone[tostring(s.key)] = true
+        end
+    end)
+end
+
+local leavingAt = -1e9
+-- Mode của trận vừa chơi (script ghi lúc join); không rõ => "Khác"
+local function leaveWanted()
+    local st = readState()
+    local m = (st.mode and os.time() - (st.joinedAt or 0) <= 14400) and st.mode or "Khác"
+    return Options.LeaveModes.Value[m] == true
+end
 local function onRemoteEvent(evt, ...)
     local args = table.pack(...)
+    if evt == "game_finished" then pcall(onFinish, args[1]) end
     if Options.Webhook_SecretPing.Value then
         if SECRET_EVT[evt] or evt == "game_finished" then
             if next(SECRET) == nil then loadSecret() end
@@ -706,6 +827,14 @@ local function onRemoteEvent(evt, ...)
         lastMatchSent = os.clock()
         task.spawn(sendMatchResult, args[1])
     end
+    if evt == "game_finished" and Options.AutoLeaveFinish.Value and not inLobby() and os.clock() - leavingAt > 20 and leaveWanted() then
+        leavingAt = os.clock()
+        task.spawn(function() -- không delay: xong/thua là về lobby (đặt cuối hàm để state + webhook đã được gọi trước)
+            call("teleport_back_to_lobby")
+            task.wait(8)
+            if not inLobby() then TS:Teleport(tonumber(readState().lobbyPlace) or game.PlaceId) end
+        end)
+    end
 end
 
 local eps = RS:FindFirstChild("endpoints")
@@ -720,16 +849,18 @@ end
 ---------------------------------------------------------------- AUTO LOOP (lobby)
 -- autoTick chạy mỗi 0.5s VÀ chạy ngay lập tức khi bật toggle Auto / khi load config
 local ticking = false
+local cfgLoaded = false -- chỉ auto sau khi config load XONG (load từng option, Portal_Auto có thể bật trước Challenge_Auto)
 local function autoTick()
-    if ticking or busy or Fluent.Unloaded or not inLobby() then return end
+    if not cfgLoaded or ticking or busy or Fluent.Unloaded or not inLobby() then return end
     ticking = true
     local ok, err = pcall(function()
         -- chọn mode đầu tiên theo ưu tiên mà đã bật Auto VÀ đang join được
         for _, mode in PRIORITY do
             local o = Options[mode .. "_Auto"]
-            if o and o.Value and canJoin(mode) then
-                joinOnce(mode)
-                break
+            if o and o.Value then
+                local s = modeStatus(mode)
+                if s == "ready" then joinOnce(mode, true) break
+                elseif s == "wait" then break end -- mode cao đang chờ: đừng nhảy sang Portal/Story
             end
         end
     end)
@@ -749,7 +880,40 @@ end
 
 task.spawn(function()
     pcall(function() workspace:WaitForChild("_MAP_CONFIG", 15) end)
-    if inLobby() then mutate(function(st) st.lobbyPlace = game.PlaceId end) end
+    if inLobby() then mutate(function(st) st.lobbyPlace = game.PlaceId end) return end
+    -- Trong trận: mode lưu trong state chỉ đúng nếu script vừa join (teleport tới trong vài chục giây).
+    -- Trận mới mà state quá cũ => bạn vào tay, xoá mode cũ để không hiện nhầm Portal/Challenge.
+    local fresh = false
+    mutate(function(st)
+        if st.matchJob ~= game.JobId then
+            if st.mode and os.time() - (st.joinedAt or 0) > 240 then st.mode = nil end
+            st.matchJob = game.JobId
+            fresh = (st.mode == nil)
+        end
+    end)
+    if not fresh then return end
+    -- Vào tay: đọc Loader.LevelData (id + _gamemode) để biết mode
+    local id, gm
+    for _ = 1, 40 do
+        local ok, i, g = pcall(function()
+            local ld = require(RS.Framework.Loader).LevelData
+            if type(ld) ~= "table" then return nil end
+            return rawget(ld, "id"), rawget(ld, "_gamemode")
+        end)
+        if ok and type(i) == "string" then id, gm = i, tostring(g or ""):lower() break end
+        task.wait(0.5)
+    end
+    if not id then return end
+    local l, m = id:lower(), nil
+    if l:find("portal") or gm:find("portal") then m = "Portal"
+    elseif l:find("infinite") or gm:find("infinite") then m = "Infinite"
+    elseif l:find("legend") or gm:find("legend") then m = "Legend"
+    elseif gm:find("daily") then m = "Daily"
+    elseif gm:find("challenge") then m = "Challenge"
+    elseif gm == "story" or l:find("_level_") then m = "Story" end
+    if m then
+        mutate(function(st) st.mode, st.key, st.joinedAt, st.window = m, id, os.time(), windowNow() end)
+    end
 end)
 task.spawn(function()
     while not Fluent.Unloaded do
@@ -813,6 +977,29 @@ task.spawn(function()
     end
 end)
 
+---------------------------------------------------------------- PANEL TRẠNG THÁI
+task.spawn(function()
+    while not Fluent.Unloaded do
+        pcall(function()
+            local st = readState()
+            local L = {}
+            if inLobby() then L[1] = busy and "ĐANG: join " or "ĐANG: lobby / chờ" else L[1] = "ĐANG: trong trận " .. tostring(st.mode or "không rõ (vào tay)") end
+            local left = CH_DUR - (serverNow() % CH_DUR)
+            L[2] = string.format("Challenge đổi sau %d:%02d", left // 60, left % 60)
+            local cs = chStat()
+            L[2] = L[2] .. " | challenge stat: " .. tostring(cs) .. (cs == windowNow() and " (ĐÃ LÀM)" or " (chưa)")
+            for _, m in PRIORITY do
+                local o = Options[m .. "_Auto"]
+                if o and o.Value then table.insert(L, m .. ": " .. tostring(STAT[m] or "...")) end
+            end
+            local d = dCache and tostring(dCache.current_uuid)
+            if d then table.insert(L, "Daily: " .. (dailyDone(d) and "ĐÃ LÀM" or "CHƯA LÀM")) end
+            pcall(function() StatP:SetDesc(table.concat(L, "\n")) end)
+        end)
+        task.wait(2)
+    end
+end)
+
 ---------------------------------------------------------------- SAVE
 SaveManager:SetLibrary(Fluent)
 InterfaceManager:SetLibrary(Fluent)
@@ -825,5 +1012,6 @@ SaveManager:BuildConfigSection(Tabs.Settings)
 
 Window:SelectTab(2)
 Fluent:Notify({ Title = "join", Content = "Đã tải script.", Duration = 5 })
-SaveManager:LoadAutoloadConfig()
+pcall(function() SaveManager:LoadAutoloadConfig() end)
+cfgLoaded = true
 task.defer(autoTick) -- config xong là join luôn, không chờ vòng lặp
