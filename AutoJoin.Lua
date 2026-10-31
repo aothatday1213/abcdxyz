@@ -11,23 +11,18 @@ local Options = Fluent.Options
 local ct = RS:WaitForChild("endpoints"):WaitForChild("client_to_server")
 
 ---------------------------------------------------------------- DATA
-local WORLDS = { Namek = "namek", Karakura = "karakura", Shibuya = "shibuya", Marineford = "marineford" }
-local WORLD_NAMES = { "Namek", "Karakura", "Shibuya", "Marineford" }
-local STORY_ACTS = { "1", "2", "3", "4", "5", "6" }
-local LEGEND_ACTS = { "1", "2", "3" }
 local DIFFS = { "Normal", "Hard", "Insane" }
-local PODS = { "Auto" }
-for i = 1, 11 do table.insert(PODS, "P" .. i) end
-local CH_PODS = {}
-for i = 1, 4 do table.insert(CH_PODS, "CH" .. i) end
 local CH_MODS = {
     "high_cost", "short_range", "fast_enemies", "regen_enemies", "tank_enemies", "shield_enemies",
     "double_cost", "triple_cost", "hyper_regen_enemies", "hyper_shield_enemies",
     "godspeed_enemies", "flying_enemies", "mini_range",
 }
 local CH_DUR = 1800 -- GameplaySettings.CHALLENGE_DURATION
--- Thứ tự ưu tiên (mode nào bật Auto + đang có thể join thì lấy mode đầu tiên)
-local PRIORITY = { "Daily", "Challenge", "Portal", "Legend", "Infinite", "Story" }
+
+-- Thứ tự ưu tiên (đổi được ở tab Priority). PRIORITY được sửa tại chỗ nên mọi vòng lặp đều thấy thứ tự mới.
+local ALL_MODES = { "Daily", "Challenge", "Event", "Portal", "Legend", "Infinite", "Story" }
+local PRIORITY = {}
+for i, m in ipairs(ALL_MODES) do PRIORITY[i] = m end
 
 local function hasAny(set)
     for _, v in pairs(set or {}) do
@@ -36,11 +31,108 @@ local function hasAny(set)
     return false
 end
 
-local function buildLevelId(mode, world, act)
-    local w = WORLDS[world]
-    if mode == "Story" then return w .. "_level_" .. act
-    elseif mode == "Infinite" then return w .. "_infinite"
-    else return "shibuya_legend_" .. act end
+-- ===== TỰ ĐỌC DỮ LIỆU GAME =====
+local function req(m) local ok, r = pcall(require, m) return (ok and type(r) == "table") and r or {} end
+local Data = RS:WaitForChild("Framework"):WaitForChild("Data")
+local Worlds, Levels, Order = req(Data.Worlds), req(Data.Levels), req(Data.WorldLevelOrder)
+
+local function natKey(s) return (tostring(s):gsub("%d+", function(n) return string.format("%05d", tonumber(n)) end)) end
+local function nsort(t) table.sort(t, function(a, b) return natKey(a) < natKey(b) end) return t end
+
+-- Map dùng cho Story/Infinite/Challenge: theo WORLD_ORDER của game
+local WKEY, WORLD_NAMES = {}, {} -- WKEY[nhãn] = key world
+-- Thứ tự theo mảng *_ORDER của game, world mới chưa nằm trong mảng đó vẫn được nối vào cuối (lọc bằng pred)
+local function worldList(base, pred)
+    local list, seen = {}, {}
+    for _, k in ipairs(type(base) == "table" and base or {}) do
+        if not seen[k] then seen[k] = true table.insert(list, k) end
+    end
+    local extra = {}
+    for k, w in pairs(Worlds) do
+        if type(w) == "table" and not seen[k] and pred(w) then table.insert(extra, k) end
+    end
+    for _, k in ipairs(nsort(extra)) do table.insert(list, k) end
+    return list
+end
+local function hasStoryLevels(w)
+    for id, lv in pairs(Levels) do
+        if type(lv) == "table" and lv.world == w and (lv.infinite or tostring(id):match("_level_%d+$")) then return true end
+    end
+    return false
+end
+local storyOrder = worldList(Order.WORLD_ORDER, function(w) return not w.legend_stage and not w.event_world end)
+for _, k in ipairs(storyOrder) do
+    local w = Worlds[k]
+    if type(w) == "table" and hasStoryLevels(k) then
+        local label = tostring(k):sub(1, 1):upper() .. tostring(k):sub(2) -- giữ tên cũ (Namek, Karakura...) để config đã lưu vẫn khớp
+        if WKEY[label] and WKEY[label] ~= k then label = label .. " [" .. k .. "]" end
+        if not WKEY[label] then WKEY[label] = k table.insert(WORLD_NAMES, label) end
+    end
+end
+
+-- Chỉ mục level: STORY[world][act] = id, INF[world] = id, WLEVELS[world] = {id...}
+local STORY, INF, WLEVELS = {}, {}, {}
+for id, lv in pairs(Levels) do
+    if type(lv) == "table" and type(lv.world) == "string" and not lv.cant_start
+        and not lv._portal_only_level and not tostring(id):lower():find("portal") then
+        local w = lv.world
+        WLEVELS[w] = WLEVELS[w] or {}
+        table.insert(WLEVELS[w], id)
+        if lv.infinite then
+            INF[w] = id
+        else
+            local a = tostring(id):match("_level_(%d+)$")
+            if a then STORY[w] = STORY[w] or {} STORY[w][a] = id end
+        end
+    end
+end
+if #WORLD_NAMES == 0 then -- dự phòng nếu đọc module lỗi
+    for _, k in ipairs({ "namek", "marineford", "karakura", "Shibuya" }) do
+        WKEY[k] = k table.insert(WORLD_NAMES, k)
+        STORY[k], INF[k] = {}, k:lower() .. "_infinite"
+        for a = 1, 6 do STORY[k][tostring(a)] = k:lower() .. "_level_" .. a end
+    end
+end
+
+local function actsOf(w)
+    local r = {}
+    for a in pairs(STORY[w] or {}) do table.insert(r, a) end
+    table.sort(r, function(x, y) return tonumber(x) < tonumber(y) end)
+    return #r > 0 and r or { "1" }
+end
+local function levelsOfWorlds(list)
+    local r = {}
+    for _, w in ipairs(type(list) == "table" and list or {}) do
+        local ids = {}
+        for _, id in ipairs(WLEVELS[w] or {}) do table.insert(ids, id) end
+        for _, id in ipairs(nsort(ids)) do table.insert(r, id) end
+    end
+    return r
+end
+local LEGEND_LEVELS = levelsOfWorlds(worldList(Order.LEGEND_WORLD_ORDER, function(w) return w.legend_stage and not w.event_world end))
+local EVENT_LEVELS = levelsOfWorlds(worldList(Order.STORY_EVENT_WORLDS, function(w) return w.event_world end))
+
+-- Số pod Story đọc từ workspace
+local PODS = { "Auto" }
+do
+    local l = workspace:FindFirstChild("_LOBBIES")
+    local s = l and l:FindFirstChild("Story")
+    local n = 0
+    if s then for _, v in ipairs(s:GetChildren()) do local i = tonumber(v.Name:match("^P(%d+)$")) if i and i > n then n = i end end end
+    for i = 1, (n > 0 and n or 11) do table.insert(PODS, "P" .. i) end
+end
+
+-- Level id theo mode (đọc dropdown)
+local function levelFor(mode)
+    if mode == "Story" then
+        local w = WKEY[Options.Story_World.Value] or Options.Story_World.Value
+        return STORY[w] and STORY[w][tostring(Options.Story_Act.Value)]
+    elseif mode == "Infinite" then
+        return INF[WKEY[Options.Infinite_World.Value] or Options.Infinite_World.Value]
+    end
+    local o = Options[mode .. "_Level"]
+    local v = o and o.Value
+    return (v and Levels[v]) and v or nil
 end
 
 ---------------------------------------------------------------- STATE (lưu file, sống qua teleport)
@@ -72,6 +164,7 @@ local function windowNow() return math.floor(serverNow() / CH_DUR) end
 
 ---------------------------------------------------------------- LOGIC
 local busy = false
+local LASTERR -- lỗi gần nhất, hiện ở panel tab Chung (thay cho print/warn)
 local StatP
 local cool = {} -- cool[mode] = os.clock() hết cooldown (mode lỗi thì nhường mode khác)
 
@@ -253,7 +346,7 @@ local function chWhy(p) -- nil = join được, ngược lại trả lý do
     if hasAny(ws) and not allSel(ws, #WORLD_NAMES) then
         local w, ok = tostring(podValue(p, "World")), false
         for n, v in pairs(ws) do
-            if v == true and WORLDS[n] == w then ok = true end
+            if v == true and tostring(WKEY[n] or n):lower() == w:lower() then ok = true end
         end
         if not ok then return "sai map(" .. w .. ")" end
     end
@@ -324,7 +417,7 @@ task.spawn(lastDailyDone)
 task.spawn(nextPortal)
 
 -- ---- Trạng thái mode: "ready" = join; "wait" = giữ chỗ (KHÔNG nhường mode thấp hơn); "skip" = nhường mode kế
-local STAT, pendSince, lastSkip = {}, nil, nil
+local STAT, pendSince = {}, nil
 local bootAt = os.clock() -- chờ dữ liệu tải xong
 local function booting() return os.clock() - bootAt < 25 end
 local function setS(mode, s, why) STAT[mode] = s .. (why and (" | " .. why) or "") return s end
@@ -367,15 +460,12 @@ local function modeStatus(mode)
         end
         -- chưa làm (còn pod chưa xong / inactive tạm thời / chưa thấy pod): GIỮ CHỖ, chặn Portal
         if transient or #pods == 0 then return setS(mode, "wait", d) end
-        if lastSkip ~= d then
-            lastSkip = d
-            print("[AutoJoin] Challenge SKIP -> nhường mode sau | " .. d .. " | stat=" .. tostring(chStat()) .. " window=" .. tostring(windowNow()))
-        end
         return setS(mode, "skip", d) -- tất cả pod: đã làm / sai lọc / lỗi 3 lần -> nhường Portal
     elseif mode == "Portal" then
         if nextPortal() then return setS(mode, "ready", "có portal") end
         return setS(mode, "skip", "hết portal / đang CD")
     end
+    if not levelFor(mode) then return setS(mode, "skip", "chưa có level") end
     local pod = findStoryPod(Options[mode .. "_Pod"].Value)
     if pod then return setS(mode, "ready", pod.Name) end
     return setS(mode, "skip", "không có pod trống")
@@ -425,9 +515,11 @@ local Tabs = {
     Story     = Window:AddTab({ Title = "Story", Icon = "book-open" }),
     Infinite  = Window:AddTab({ Title = "Infinite", Icon = "infinity" }),
     Legend    = Window:AddTab({ Title = "Legend", Icon = "crown" }),
+    Event     = Window:AddTab({ Title = "Event", Icon = "gift" }),
     Challenge = Window:AddTab({ Title = "Challenge", Icon = "swords" }),
     Daily     = Window:AddTab({ Title = "Daily Challenge", Icon = "calendar-days" }),
     Portal    = Window:AddTab({ Title = "Portal", Icon = "door-open" }),
+    Priority  = Window:AddTab({ Title = "Priority", Icon = "list-ordered" }),
     Webhook   = Window:AddTab({ Title = "Webhook", Icon = "send" }),
     Settings  = Window:AddTab({ Title = "Settings", Icon = "settings" }),
 }
@@ -503,14 +595,10 @@ local function joinOnce(mode, auto)
 
         if mode == "Portal" then
             if auto then -- chốt chặn cuối: mode cao hơn đang ready/wait thì không dùng portal
-                local hs, hm = higherState("Portal")
-                if hs then print("[AutoJoin] Portal bị chặn bởi " .. tostring(hm) .. " (" .. hs .. ")") return end
+                if higherState("Portal") then return end
             end
             local chosen = nextPortal()
             if not chosen then return end
-            local snap = {}
-            for _, m in PRIORITY do if STAT[m] then table.insert(snap, m .. "=" .. STAT[m]) end end
-            print("[AutoJoin] DÙNG PORTAL " .. (auto and "(auto)" or "(tay)") .. " | " .. table.concat(snap, " ; "))
             local pok, pres = usePortal(chosen, Options.Portal_Friends.Value)
             -- thành công: server trả về bảng lobby (có LevelData). Khác thế (bận/lỗi): bỏ portal này 12 phút
             if not (pok and type(pres) == "table" and pres.LevelData ~= nil) then
@@ -551,12 +639,11 @@ local function joinOnce(mode, auto)
             return
         end
 
-        -- Story / Infinite / Legend
+        -- Story / Infinite / Legend / Event
         local pod = findStoryPod(Options[mode .. "_Pod"].Value)
         if not pod then return end
-        local world = (mode == "Legend") and "Shibuya" or Options[mode .. "_World"].Value
-        local act = Options[mode .. "_Act"] and Options[mode .. "_Act"].Value or "1"
-        local level = buildLevelId(mode, world, act)
+        local level = levelFor(mode)
+        if not level then cool[mode] = os.clock() + 20 return end
         local diff = Options[mode .. "_Diff"].Value
         local friends = Options[mode .. "_Friends"].Value
         local name = pod.Name
@@ -593,40 +680,56 @@ local function joinOnce(mode, auto)
             end
         end)
     end)
-    if not ok then warn("[AutoJoin] lỗi:", err) end
+    if not ok then LASTERR = "join " .. tostring(mode) .. ": " .. tostring(err) end
     busy = false
 end
 
 ---------------------------------------------------------------- UI: CHUNG
 Tabs.General:AddParagraph({
     Title = "Cách dùng",
-    Content = "Ưu tiên: Daily > Challenge > Portal > Legend > Infinite > Story.\nMode đã xong/không có thì nhường mode kế; mode đang chờ (cooldown, pod bận, đợi challenge mới) thì GIỮ chỗ, không nhảy sang Portal.",
+    Content = "Thứ tự ưu tiên chỉnh ở tab Priority (mặc định: Daily > Challenge > Event > Portal > Legend > Infinite > Story).\nMode đã xong/không có thì nhường mode kế; mode đang chờ (cooldown, pod bận, đợi challenge mới) thì GIỮ chỗ, không nhảy sang mode thấp hơn.",
 })
 StatP = Tabs.General:AddParagraph({ Title = "Đang làm / cần làm", Content = "..." })
 Tabs.General:AddToggle("AutoStart", { Title = "Tự bấm Start", Default = true })
 Tabs.General:AddSlider("StartDelay", { Title = "Delay trước khi Start (giây)", Default = 1, Min = 0, Max = 10, Rounding = 1 })
 Tabs.General:AddToggle("AutoLeaveFinish", { Title = "Tự về lobby khi kết thúc ván", Description = "Hết trận (thắng/thua) là teleport về lobby, không chờ màn kết quả", Default = true })
-Tabs.General:AddDropdown("LeaveModes", { Title = "Chỉ về lobby khi ván thuộc mode", Description = "Mode không chọn thì ở lại trận. 'Khác' = trận không do script join", Values = { "Story", "Infinite", "Legend", "Challenge", "Daily", "Portal", "Khác" }, Multi = true, Default = { "Challenge", "Daily" } })
+Tabs.General:AddDropdown("LeaveModes", { Title = "Chỉ về lobby khi ván thuộc mode", Description = "Mode không chọn thì ở lại trận. 'Khác' = trận không do script join", Values = { "Story", "Infinite", "Legend", "Event", "Challenge", "Daily", "Portal", "Khác" }, Multi = true, Default = { "Challenge", "Daily" } })
 Tabs.General:AddToggle("LeaveOnNew", {
     Title = "Tự rời trận khi có challenge mới",
     Description = "Đang farm mà sang khung 30 phút mới (hoặc Daily mới) và đã bật Auto tương ứng thì về lobby để join. Trận Story/Infinite đang chơi sẽ bị bỏ ở mỗi mốc :00 / :30.",
     Default = false,
 })
 
----------------------------------------------------------------- UI: Story / Infinite / Legend
-local function buildStoryLike(mode, tab, withWorld, acts, actDesc)
-    if withWorld then tab:AddDropdown(mode .. "_World", { Title = "Map", Values = WORLD_NAMES, Default = 1 }) end
-    if acts then tab:AddDropdown(mode .. "_Act", { Title = "Act", Description = actDesc, Values = acts, Default = 1 }) end
+---------------------------------------------------------------- UI: Story / Infinite / Legend / Event
+local function buildStoryLike(mode, tab, opt)
+    if opt.world then tab:AddDropdown(mode .. "_World", { Title = "Map", Values = WORLD_NAMES, Default = 1 }) end
+    if opt.act then tab:AddDropdown(mode .. "_Act", { Title = "Act", Values = actsOf(WKEY[WORLD_NAMES[1]]), Default = 1 }) end
+    if opt.levels then tab:AddDropdown(mode .. "_Level", { Title = "Level", Values = opt.levels, Default = 1 }) end
     tab:AddDropdown(mode .. "_Diff", { Title = "Độ khó", Values = DIFFS, Default = 1 })
     tab:AddDropdown(mode .. "_Pod", { Title = "Pod", Values = PODS, Default = 1 })
     tab:AddToggle(mode .. "_Friends", { Title = "Friends Only", Default = false })
     tab:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, mode) end })
     tab:AddToggle(mode .. "_Auto", { Title = "Auto Join " .. mode .. " (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
+    -- đổi map thì danh sách act đổi theo
+    local w, a = Options[mode .. "_World"], Options[mode .. "_Act"]
+    if w and a then
+        w:OnChanged(function()
+            pcall(function()
+                local v, cur = actsOf(WKEY[w.Value]), a.Value
+                a:SetValues(v)
+                a:SetValue(table.find(v, cur) and cur or v[1])
+            end)
+        end)
+    end
 end
-buildStoryLike("Story", Tabs.Story, true, STORY_ACTS, "Act 1-6")
-buildStoryLike("Infinite", Tabs.Infinite, true, nil)
-Tabs.Legend:AddParagraph({ Title = "Legend", Content = "Hiện chỉ có Shibuya, act 1-3." })
-buildStoryLike("Legend", Tabs.Legend, false, LEGEND_ACTS, "Shibuya Legend 1-3")
+buildStoryLike("Story", Tabs.Story, { world = true, act = true })
+buildStoryLike("Infinite", Tabs.Infinite, { world = true })
+buildStoryLike("Legend", Tabs.Legend, { levels = (#LEGEND_LEVELS > 0) and LEGEND_LEVELS or { "(trống)" } })
+if #EVENT_LEVELS > 0 then
+    buildStoryLike("Event", Tabs.Event, { levels = EVENT_LEVELS })
+else
+    Tabs.Event:AddParagraph({ Title = "Event", Content = "Hiện game không có event story." })
+end
 
 ---------------------------------------------------------------- UI: Challenge
 Tabs.Challenge:AddParagraph({
@@ -640,7 +743,7 @@ Tabs.Challenge:AddToggle("Challenge_SkipDone", {
     Description = "Làm lại cùng challenge trong 30 phút chỉ nhận thưởng lặp (gem 15 thay vì 100)",
     Default = true,
 })
-Tabs.Challenge:AddToggle("Challenge_IgnoreActive", { Title = "Bỏ qua cờ Active (thử)", Description = "Bật nếu pod báo inactive nhưng bạn vẫn vào được", Default = false })
+Tabs.Challenge:AddToggle("Challenge_IgnoreActive", { Title = "Bỏ qua cờ Active", Description = "Cờ Active của pod thường luôn false ở lobby nên mặc định BẬT. Tắt nếu muốn chỉ join pod báo Active", Default = true })
 Tabs.Challenge:AddButton({ Title = "Join ngay 1 lần", Callback = function() task.spawn(joinOnce, "Challenge") end })
 Tabs.Challenge:AddToggle("Challenge_Auto", { Title = "Auto Join Challenge (lặp lại)", Description = "Tự join khi đang ở lobby", Default = false })
 
@@ -657,6 +760,50 @@ Tabs.Portal:AddParagraph({ Title = "Portal", Content = "Dùng portal bất kỳ 
 Tabs.Portal:AddToggle("Portal_Friends", { Title = "Friends Only", Default = false })
 Tabs.Portal:AddButton({ Title = "Dùng portal 1 lần", Callback = function() task.spawn(joinOnce, "Portal") end })
 Tabs.Portal:AddToggle("Portal_Auto", { Title = "Auto dùng Portal (lặp lại)", Description = "Tự dùng portal khi đang ở lobby", Default = false })
+
+---------------------------------------------------------------- UI: PRIORITY
+local PriP
+local function applyPriority()
+    local seen, list, dup = {}, {}, {}
+    for i = 1, #ALL_MODES do
+        local o = Options["Priority_" .. i]
+        local v = o and o.Value
+        if v and table.find(ALL_MODES, v) then
+            if seen[v] then table.insert(dup, v) else seen[v] = true table.insert(list, v) end
+        end
+    end
+    for _, m in ipairs(ALL_MODES) do
+        if not seen[m] then table.insert(list, m) end -- mode bị thiếu (do chọn trùng) xếp xuống cuối
+    end
+    table.clear(PRIORITY)
+    for i, m in ipairs(list) do PRIORITY[i] = m end
+    if PriP then
+        local txt = table.concat(PRIORITY, " > ")
+        if #dup > 0 then txt = txt .. "\n(Chọn trùng: " .. table.concat(dup, ", ") .. " - bị bỏ qua, mode thiếu xếp xuống cuối)" end
+        pcall(function() PriP:SetDesc(txt) end)
+    end
+end
+
+Tabs.Priority:AddParagraph({
+    Title = "Thứ tự ưu tiên",
+    Content = "Hạng 1 được xét đầu tiên. Mode chỉ chạy khi bật Auto ở tab của nó. Daily và Challenge là mode 'giữ chỗ': khi đang chờ thì mode thấp hơn không được chen vào.",
+})
+PriP = Tabs.Priority:AddParagraph({ Title = "Thứ tự hiện tại", Content = table.concat(PRIORITY, " > ") })
+for i = 1, #ALL_MODES do
+    Tabs.Priority:AddDropdown("Priority_" .. i, { Title = "Hạng " .. i, Values = table.clone(ALL_MODES), Default = i })
+end
+for i = 1, #ALL_MODES do
+    Options["Priority_" .. i]:OnChanged(applyPriority)
+end
+Tabs.Priority:AddButton({
+    Title = "Về mặc định",
+    Callback = function()
+        for i, m in ipairs(ALL_MODES) do
+            pcall(function() Options["Priority_" .. i]:SetValue(m) end)
+        end
+        applyPriority()
+    end,
+})
 
 ---------------------------------------------------------------- WEBHOOK
 Tabs.Webhook:AddInput("Webhook_Url", { Title = "Webhook URL", Default = "", Placeholder = "https://discord.com/api/webhooks/..." })
@@ -860,15 +1007,15 @@ local function autoTick()
             if o and o.Value then
                 local s = modeStatus(mode)
                 if s == "ready" then joinOnce(mode, true) break
-                elseif s == "wait" then break end -- mode cao đang chờ: đừng nhảy sang Portal/Story
+                elseif s == "wait" then break end -- mode cao đang chờ: đừng nhảy sang mode thấp hơn
             end
         end
     end)
     ticking = false
-    if not ok then warn("[AutoJoin] tick lỗi:", err) end
+    if not ok then LASTERR = "tick: " .. tostring(err) end
 end
 
-for _, m in PRIORITY do
+for _, m in ipairs(ALL_MODES) do
     local o = Options[m .. "_Auto"]
     if o then
         o:OnChanged(function()
@@ -910,6 +1057,7 @@ task.spawn(function()
     elseif l:find("legend") or gm:find("legend") then m = "Legend"
     elseif gm:find("daily") then m = "Daily"
     elseif gm:find("challenge") then m = "Challenge"
+    elseif l:find("halloween") or gm:find("event") then m = "Event"
     elseif gm == "story" or l:find("_level_") then m = "Story" end
     if m then
         mutate(function(st) st.mode, st.key, st.joinedAt, st.window = m, id, os.time(), windowNow() end)
@@ -994,6 +1142,7 @@ task.spawn(function()
             end
             local d = dCache and tostring(dCache.current_uuid)
             if d then table.insert(L, "Daily: " .. (dailyDone(d) and "ĐÃ LÀM" or "CHƯA LÀM")) end
+            if LASTERR then table.insert(L, "LỖI: " .. LASTERR) end
             pcall(function() StatP:SetDesc(table.concat(L, "\n")) end)
         end)
         task.wait(2)
@@ -1013,5 +1162,7 @@ SaveManager:BuildConfigSection(Tabs.Settings)
 Window:SelectTab(2)
 Fluent:Notify({ Title = "join", Content = "Đã tải script.", Duration = 5 })
 pcall(function() SaveManager:LoadAutoloadConfig() end)
+local pok, perr = pcall(applyPriority) -- áp thứ tự đã lưu trong config
+if not pok then LASTERR = "priority: " .. tostring(perr) end
 cfgLoaded = true
 task.defer(autoTick) -- config xong là join luôn, không chờ vòng lặp
